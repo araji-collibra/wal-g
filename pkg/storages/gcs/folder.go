@@ -3,8 +3,10 @@ package gcs
 import (
 	"context"
 	"encoding/base64"
+	"fmt"
 	"io"
 	"math/rand"
+	"os"
 	"path"
 	"strconv"
 	"strings"
@@ -281,68 +283,73 @@ func (folder *Folder) PutObject(name string, content io.Reader) error {
 	tracelog.DebugLogger.Printf("Put %v into %v\n", name, folder.path)
 	object := folder.BuildObjectHandle(folder.joinPath(folder.path, name))
 
-	ctx, cancel := folder.createTimeoutContext()
-	defer cancel()
+	if _, ok := os.LookupEnv("ARDBG"); ok {
+		tracelog.DebugLogger.Println("Switching to XML Multipart Upload")
+		UploadToBucket(fmt.Sprintf("%s/%s", folder.GetPath(), name), content)
+	} else {
 
-	chunkNum := 0
-	tmpChunks := make([]*gcs.ObjectHandle, 0)
+		ctx, cancel := folder.createTimeoutContext()
+		defer cancel()
 
-	for {
-		tmpChunkName := folder.joinPath(name+"_chunks", "chunk"+strconv.Itoa(chunkNum))
-		objectChunk := folder.BuildObjectHandle(folder.joinPath(folder.path, tmpChunkName))
-		chunkUploader := NewUploader(objectChunk, folder.uploaderOptions...)
-		dataChunk := chunkUploader.allocateBuffer()
+		chunkNum := 0
+		tmpChunks := make([]*gcs.ObjectHandle, 0)
 
-		n, err := fillBuffer(content, dataChunk)
-		if err != nil && err != io.EOF {
-			tracelog.ErrorLogger.Printf("Unable to read content of %s, err: %v", name, err)
-			return NewError(err, "Unable to read a chunk of data to upload")
-		}
+		for {
+			tmpChunkName := folder.joinPath(name+"_chunks", "chunk"+strconv.Itoa(chunkNum))
+			objectChunk := folder.BuildObjectHandle(folder.joinPath(folder.path, tmpChunkName))
+			chunkUploader := NewUploader(objectChunk, folder.uploaderOptions...)
+			dataChunk := chunkUploader.allocateBuffer()
 
-		if n == 0 {
-			break
-		}
-
-		chunk := chunk{
-			name:  tmpChunkName,
-			index: chunkNum,
-			data:  dataChunk,
-			size:  n,
-		}
-
-		if err := chunkUploader.UploadChunk(ctx, chunk); err != nil {
-			return NewError(err, "Unable to upload an object chunk")
-		}
-
-		tmpChunks = append(tmpChunks, objectChunk)
-
-		chunkNum++
-
-		if err == io.EOF {
-			break
-		}
-
-		if len(tmpChunks) == composeChunkLimit {
-			// Since there is a limit to the number of components that can be composed in a single operation, merge chunks partially.
-			compositeChunkName := folder.joinPath(name+"_chunks", "composite"+strconv.Itoa(chunkNum))
-			compositeChunk := folder.BuildObjectHandle(folder.joinPath(folder.path, compositeChunkName))
-
-			tracelog.DebugLogger.Printf("Compose temporary chunks into an intermediate chunk %v\n", compositeChunkName)
-
-			if err := composeChunks(ctx, NewUploader(compositeChunk, folder.uploaderOptions...), tmpChunks); err != nil {
-				return NewError(err, "Failed to compose temporary chunks into an intermediate chunk")
+			n, err := fillBuffer(content, dataChunk)
+			if err != nil && err != io.EOF {
+				tracelog.ErrorLogger.Printf("Unable to read content of %s, err: %v", name, err)
+				return NewError(err, "Unable to read a chunk of data to upload")
 			}
 
-			tmpChunks = []*gcs.ObjectHandle{compositeChunk}
+			if n == 0 {
+				break
+			}
+
+			chunk := chunk{
+				name:  tmpChunkName,
+				index: chunkNum,
+				data:  dataChunk,
+				size:  n,
+			}
+
+			if err := chunkUploader.UploadChunk(ctx, chunk); err != nil {
+				return NewError(err, "Unable to upload an object chunk")
+			}
+
+			tmpChunks = append(tmpChunks, objectChunk)
+
+			chunkNum++
+
+			if err == io.EOF {
+				break
+			}
+
+			if len(tmpChunks) == composeChunkLimit {
+				// Since there is a limit to the number of components that can be composed in a single operation, merge chunks partially.
+				compositeChunkName := folder.joinPath(name+"_chunks", "composite"+strconv.Itoa(chunkNum))
+				compositeChunk := folder.BuildObjectHandle(folder.joinPath(folder.path, compositeChunkName))
+
+				tracelog.DebugLogger.Printf("Compose temporary chunks into an intermediate chunk %v\n", compositeChunkName)
+
+				if err := composeChunks(ctx, NewUploader(compositeChunk, folder.uploaderOptions...), tmpChunks); err != nil {
+					return NewError(err, "Failed to compose temporary chunks into an intermediate chunk")
+				}
+
+				tmpChunks = []*gcs.ObjectHandle{compositeChunk}
+			}
+		}
+
+		tracelog.DebugLogger.Printf("Compose file %v from chunks\n", object.ObjectName())
+
+		if err := composeChunks(ctx, NewUploader(object, folder.uploaderOptions...), tmpChunks); err != nil {
+			return NewError(err, "Failed to compose temporary chunks into an object")
 		}
 	}
-
-	tracelog.DebugLogger.Printf("Compose file %v from chunks\n", object.ObjectName())
-
-	if err := composeChunks(ctx, NewUploader(object, folder.uploaderOptions...), tmpChunks); err != nil {
-		return NewError(err, "Failed to compose temporary chunks into an object")
-	}
-
 	tracelog.DebugLogger.Printf("Put %v done\n", name)
 
 	return nil
